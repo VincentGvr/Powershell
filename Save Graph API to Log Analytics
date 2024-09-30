@@ -1,0 +1,149 @@
+# Get information required for Log Analytics workspace from Automation variables.
+$logAnalyticsWorkspaceId = ""
+$sharedKey = ""
+$MSIAppId = ""
+
+$resourceGroup = ""
+$logAnalyticsWorkspace = ""
+$logType = ""
+
+$TimeStampField = Get-Date -Format "yyyy-MM-ddTmm:hh:ss.000z"
+$TimeStampField = ($TimeStampField.ToString() )# + "T06:00:00.000Z"
+
+Write-Output $TimeStampField
+
+# Set the $VerbosePreference variable so that we get verbose output in test environment.
+$VerbosePreference = "Continue"
+
+try {
+    "Logging in to Azure..."
+    Connect-AzAccount -Identity -AccountId $MSIAppId
+} catch {
+    Write-Error -Message $_.Exception
+    throw $_.Exception
+}
+
+function DropTableBeforeRun {
+    $sub = Get-AzSubscription 
+
+    $tokenPurge = Get-AzAccessToken
+
+    $tokenval = $token.Token 
+    $purgeHeaders = @{
+        "Authorization" = "Bearer $tokenval"
+        "Content-Type" = "application/json"
+    }
+
+    $purgeUri = "https://management.azure.com/subscriptions/" + $sub + `
+    "/resourceGroups/" + $resourceGroup + `
+    "/providers/Microsoft.OperationalInsights/workspaces/" + $logAnalyticsWorkspace + `
+    "/purge?api-version=2020-08-01"
+
+    $tableName = "viguyonv_custom_table_CL"
+
+    $purgeBody = @{
+      "table" = $tableName
+    }
+
+    Invoke-RestMethod -Uri $purgeUri -Method POST -Body $purgeBody -Headers $purgeHeaders
+}
+
+function Get-GraphToken {
+
+    Write-Output "Getting token with User MI .."
+
+    $graphRes = "https://graph.microsoft.com"
+    $resource = "?resource=$graphRes"
+    $client_id="&client_id=$MSIAppId"
+    $url = $env:IDENTITY_ENDPOINT + $resource + $client_id 
+    
+    $AuthHeaders = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"  
+    #$AuthHeaders.Add("Metadata", "True")
+    $AuthHeaders.Add("X-IDENTITY-HEADER", $env:IDENTITY_HEADER) 
+    
+    $accessToken = Invoke-RestMethod -Uri $url -Method 'GET' -Headers $AuthHeaders 
+
+    return $accessToken
+}
+
+$OAuth = Get-GraphToken
+$token = $OAuth.access_token 
+
+$reqHeaders = @{
+    "Authorization" = "Bearer $token"
+    "Content-Type" = "application/json"
+}
+
+#Core Script
+$usersUri = "https://graph.microsoft.com/v1.0/users?`$top=200&`$select=Id,UserPrincipalName"
+
+$body = New-Object System.Collections.ArrayList
+$UsersData = $null
+$ConvertCount = 0
+
+Function ParseUsersAndSendToLogAnalytics ($Allusers) { 
+    ForEach ($UniqueUser in $Allusers) {
+
+        if ($OAuth -and $($OAuth.expires_on) -gt (Get-Date -UFormat %s)) {  
+            #Write-Output "Token OK"
+        } else {
+            $OAuth = Get-GraphToken
+        }
+
+        if ($OAuth.access_token -eq $null) {
+            Write-Output "No Access Token"
+        } else {
+            $reqHeaders = @{
+                "Authorization" = "Bearer $token"
+                "Content-Type" = "application/json"
+            }
+        }
+
+        $UsersData = @{
+            'CreationTime'           = $TimeStampField
+            'UserIdentifier'         = $UniqueUser.Id
+            'UserPrincipalName'      = $UniqueUser.UserPrincipalName
+        };
+
+        $body.Add($UsersData) | Out-Null
+
+        ++$ConvertCount
+
+        if ($ConvertCount -eq 50) {
+            #Write-Output "Intermediate send at 50 User"
+
+            # Send the data to Log Analytics.
+            Send-OMSAPIIngestionFile -customerId $logAnalyticsWorkspaceId -sharedKey $sharedKey -body ($body | ConvertTo-Json) -logType $logType -TimeStampField "CreationTime"
+            $body = New-Object System.Collections.ArrayList
+            $ConvertCount = 0
+        }
+    }
+
+    if($ConvertCount -gt 0 -and $ConvertCount -lt 50){
+        Send-OMSAPIIngestionFile -customerId $logAnalyticsWorkspaceId -sharedKey $sharedKey -body ($body | ConvertTo-Json) -logType $logType -TimeStampField "CreationTime"
+        $body = New-Object System.Collections.ArrayList
+        $ConvertCount = 0
+    }
+
+}
+
+DropTableBeforeRun
+
+$Allusers = Invoke-RestMethod -Uri $usersUri -Method Get -Headers $reqHeaders
+
+Write-Output $Allusers.value
+Write-Output $OAuth.access_token 
+
+while($Allusers.'@odata.nextLink'){
+    Write-Output 'Started Run !'
+    ParseUsersAndSendToLogAnalytics -Allusers $Allusers.value
+    $body = New-Object System.Collections.ArrayList
+    
+    Write-Output 'Get Next Link !'
+    $Allusers = Invoke-RestMethod -Uri $Allusers.'@odata.nextLink' -Method Get -Headers $reqHeaders
+}
+
+if($Allusers.value.count -gt 0 ){
+    Write-Output 'No more nextLinks'
+    ParseUsersAndSendToLogAnalytics -Allusers $Allusers.value
+}
